@@ -11,13 +11,18 @@ import (
 	"pack.ag/amqp"
 )
 
-type MessageListener func(message *amqp.Message) error
+type MessageListener func(index int, message *amqp.Message) error
 
-type Consumer struct {
-	Client   *amqp.Client
-	Session  *amqp.Session
+type receiver struct {
 	Receiver *amqp.Receiver
 	Context  context.Context
+	index    int
+}
+
+type Consumer struct {
+	Client    *amqp.Client
+	Session   *amqp.Session
+	Recievers []receiver
 }
 
 var consumer *Consumer
@@ -33,17 +38,20 @@ var (
 	}
 )
 
-func (consumer *Consumer) receiveMsg(callback MessageListener, forceAck bool) {
-	log.Println("Start listening ...")
+func (consumer *receiver) receiveMsg(callback MessageListener, forceAck bool) {
+	log.Printf("[%v] Start listening ...\n", consumer.index)
 	for {
 		log.Println("Waiting ...")
 		// Receive next message
 		msg, err := consumer.Receiver.Receive(consumer.Context)
 		if err != nil {
+			if err == amqp.ErrLinkClosed {
+				break
+			}
 			log.Fatalln("Reading message from AMQP: ", err)
 		}
 
-		err = callback(msg)
+		err = callback(consumer.index, msg)
 		if err != nil {
 			log.Println("Message handle failure: ", err)
 		}
@@ -55,9 +63,14 @@ func (consumer *Consumer) receiveMsg(callback MessageListener, forceAck bool) {
 }
 
 func (consumer *Consumer) close(seconds time.Duration) {
-	if consumer.Receiver != nil {
-		ctx, cancel := context.WithTimeout(consumer.Context, time.Second*seconds)
-		consumer.Receiver.Close(ctx)
+	for _, recv := range consumer.Recievers {
+		ctx, cancel := context.WithTimeout(recv.Context, time.Second*seconds)
+		recv.Receiver.Close(ctx)
+		cancel()
+	}
+	if consumer.Session != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*seconds)
+		consumer.Session.Close(ctx)
 		cancel()
 	}
 	if consumer.Client != nil {
@@ -65,8 +78,8 @@ func (consumer *Consumer) close(seconds time.Duration) {
 	}
 }
 
-func processMessage(msg *amqp.Message) error {
-	log.Printf("Message received: %s\n", msg.GetData())
+func processMessage(index int, msg *amqp.Message) error {
+	log.Printf("[%v] Message received: %s\n", index, msg.GetData())
 	return nil
 }
 
@@ -75,7 +88,7 @@ func serveListener(ctx *cli.Context) error {
 		cli.ShowAppHelpAndExit(ctx, -1)
 	}
 	consumer = new(Consumer)
-	consumer.Context = context.Background()
+	consumer.Recievers = make([]receiver, 5)
 	client, err := amqp.Dial(ctx.GlobalString(AmqpUrlFlag.Name))
 	if err != nil {
 		log.Printf("Dialing AMQP server: %v\n", err)
@@ -89,16 +102,18 @@ func serveListener(ctx *cli.Context) error {
 		return err
 	}
 	consumer.Session = session
-	receiver, err := session.NewReceiver(
-		amqp.LinkSourceAddress(ctx.GlobalString(DestinationFlag.Name)),
-		amqp.LinkCredit(10),
-	)
-	if err != nil {
-		log.Printf("Creating receiver link: %v\n", err)
-		return err
+	for i := 0; i < len(consumer.Recievers); i++ {
+		recv, err := session.NewReceiver(
+			amqp.LinkSourceAddress(ctx.GlobalString(DestinationFlag.Name)),
+			amqp.LinkCredit(10),
+		)
+		if err != nil {
+			log.Printf("Creating receiver link: %v\n", err)
+			return err
+		}
+		consumer.Recievers[i] = receiver{Receiver: recv, Context: context.Background(), index: i}
+		go consumer.Recievers[i].receiveMsg(processMessage, true)
 	}
-	consumer.Receiver = receiver
-	go consumer.receiveMsg(processMessage, true)
 	return nil
 }
 
