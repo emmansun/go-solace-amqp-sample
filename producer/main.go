@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"time"
@@ -16,10 +17,12 @@ import (
 )
 
 type Producer struct {
-	Client  *amqp.Client
-	Session *amqp.Session
-	Sender  *amqp.Sender
-	Context context.Context
+	url         string
+	destination string
+	Client      *amqp.Client
+	Session     *amqp.Session
+	Sender      *amqp.Sender
+	Context     context.Context
 }
 
 var (
@@ -51,7 +54,16 @@ func (producer *Producer) sendMsg(message string) {
 	// Send message
 	err := producer.Sender.Send(producer.Context, amqp.NewMessage([]byte(message)))
 	if err != nil {
-		log.Printf("Sending message: %v\n", err)
+
+		if _, ok := err.(net.Error); ok {
+			log.Printf("Sending message: %v\n, Re connecting ...", err)
+			producer.prepareSender()
+			time.Sleep(1 * time.Second)
+			producer.sendMsg(message)
+		} else {
+			producer.close(3)
+			log.Panicf("unkonwn error: %v\n", err)
+		}
 	} else {
 		log.Println("Send message to queue completed.")
 	}
@@ -78,13 +90,12 @@ func readLine(reader io.Reader, f func(string)) {
 	}
 }
 
-func serveSender(ctx *cli.Context) error {
-	if !ctx.GlobalIsSet(AmqpUrlFlag.Name) || !ctx.GlobalIsSet(DestinationFlag.Name) {
-		cli.ShowAppHelpAndExit(ctx, -1)
-	}
-	producer = new(Producer)
+func (producer *Producer) prepareSender() error {
+	producer.Client = nil
+	producer.Session = nil
+	producer.Sender = nil
 	producer.Context = context.Background()
-	client, err := amqp.Dial(ctx.GlobalString(AmqpUrlFlag.Name))
+	client, err := amqp.Dial(producer.url)
 	if err != nil {
 		log.Printf("Dialing AMQP server: %v\n", err)
 		return err
@@ -98,13 +109,27 @@ func serveSender(ctx *cli.Context) error {
 	}
 	producer.Session = session
 	sender, err := session.NewSender(
-		amqp.LinkTargetAddress(ctx.GlobalString(DestinationFlag.Name)),
+		amqp.LinkTargetAddress(producer.destination),
 	)
 	if err != nil {
 		log.Printf("Creating sender link: %v\n", err)
 		return err
 	}
 	producer.Sender = sender
+	return nil
+}
+
+func serveSender(ctx *cli.Context) error {
+	if !ctx.GlobalIsSet(AmqpUrlFlag.Name) || !ctx.GlobalIsSet(DestinationFlag.Name) {
+		cli.ShowAppHelpAndExit(ctx, -1)
+	}
+	producer = new(Producer)
+	producer.url = ctx.GlobalString(AmqpUrlFlag.Name)
+	producer.destination = ctx.GlobalString(DestinationFlag.Name)
+	err := producer.prepareSender()
+	if err != nil {
+		return err
+	}
 	go func() {
 		readLine(os.Stdin, func(line string) {
 			producer.sendMsg(line)
