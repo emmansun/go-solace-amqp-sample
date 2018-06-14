@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -24,11 +23,13 @@ type receiver struct {
 type Consumer struct {
 	url           string
 	destination   string
-	reconnect     chan struct{}
-	reconnectOnce *sync.Once
 	Client        *amqp.Client
 	Session       *amqp.Session
 	Recievers     []receiver
+	reconnect     chan struct{}
+	reconnectOnce *sync.Once
+	shutdown      chan struct{}
+	done          sync.WaitGroup
 }
 
 var consumer *Consumer
@@ -51,36 +52,41 @@ func (consumer *receiver) receiveMsg(reconnect chan struct{}, callback MessageLi
 		// Receive next message
 		msg, err := consumer.Receiver.Receive(consumer.Context)
 		if err != nil {
+			log.Printf("[%v-%v] Got excpetion %v\n", consumer.Receiver.Address(), consumer.index, err)
 			if err == amqp.ErrLinkClosed || err == amqp.ErrSessionClosed {
 				break
-			} else if _, ok := err.(net.Error); ok {
+			} else {
 				select {
 				case reconnect <- struct{}{}:
-					log.Println("Notified to reconnect.")
+					log.Printf("[%v-%v] Notified to reconnect.\n", consumer.Receiver.Address(), consumer.index)
 					break
 				default:
 				}
-				log.Printf("[%v-%v] Reading message from AMQP: %v\n", consumer.Receiver.Address(), consumer.index, err)
 				break
 			}
-		}
-
-		err = callback(consumer, msg)
-		if err != nil {
-			log.Println("Message handle failure: ", err)
-		}
-		if forceAck || err == nil {
-			// Accept message
-			msg.Accept()
+		} else {
+			err = callback(consumer, msg)
+			if err != nil {
+				log.Println("Message handle failure: ", err)
+			}
+			if forceAck || err == nil {
+				// Accept message
+				msg.Accept()
+			}
 		}
 	}
+	log.Printf("[%v-%v] Receiver go routine exit.", consumer.Receiver.Address(), consumer.index)
 }
 
 func (consumer *Consumer) close(seconds time.Duration) {
-	for _, recv := range consumer.Recievers {
-		ctx, cancel := context.WithTimeout(recv.Context, time.Second*seconds)
-		recv.Receiver.Close(ctx)
-		cancel()
+	if consumer.Recievers != nil {
+		for _, recv := range consumer.Recievers {
+			if recv.Context != nil {
+				ctx, cancel := context.WithTimeout(recv.Context, time.Second*seconds)
+				recv.Receiver.Close(ctx)
+				cancel()
+			}
+		}
 	}
 	if consumer.Session != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*seconds)
@@ -93,7 +99,9 @@ func (consumer *Consumer) close(seconds time.Duration) {
 }
 
 func processMessage(consumer *receiver, msg *amqp.Message) error {
-	log.Printf("[%v-%v] Message received: %s\n", consumer.Receiver.Address(), consumer.index, msg.GetData())
+	if msg != nil {
+		log.Printf("[%v-%v] Message received: %s\n", consumer.Receiver.Address(), consumer.index, msg.GetData())
+	}
 	return nil
 }
 
@@ -103,7 +111,7 @@ func (consumer *Consumer) prepareConsumer() error {
 	consumer.reconnect = make(chan struct{}, 5)
 	consumer.reconnectOnce = &sync.Once{}
 	//TODO: set 0 time out future once the issue fixed.
-	client, err := amqp.Dial(consumer.url)
+	client, err := amqp.Dial(consumer.url, amqp.ConnIdleTimeout(0))
 	if err != nil {
 		log.Printf("Dialing AMQP server: %v\n", err)
 		return err
@@ -129,15 +137,31 @@ func (consumer *Consumer) prepareConsumer() error {
 		go consumer.Recievers[i].receiveMsg(consumer.reconnect, processMessage, true)
 	}
 	go func(consumer *Consumer) {
-		<-consumer.reconnect
+		consumer.done.Add(1)
+		defer func() {
+			consumer.done.Done()
+		}()
+		select {
+		case <-consumer.reconnect:
+			break
+		case <-consumer.shutdown:
+			log.Println("Received shutdown instruction, re-connect go routine exit.")
+			return
+		}
 		consumer.reconnectOnce.Do(func() {
 			consumer.close(3)
+		reconnect_loop:
 			for {
-				log.Println("re-connecting after 3 sends ...")
+				log.Println("re-connecting after 5 sends ...")
 				err := consumer.prepareConsumer()
 				if err != nil {
-					time.Sleep(5 * time.Second)
-					continue
+					select {
+					case <-time.After(5 * time.Second):
+						continue reconnect_loop
+					case <-consumer.shutdown:
+						log.Println("Received shutdown instruction, re-connect go routine exit.")
+						return
+					}
 				}
 				break
 			}
@@ -154,6 +178,7 @@ func serveListener(ctx *cli.Context) error {
 	consumer = new(Consumer)
 	consumer.url = ctx.GlobalString(AmqpUrlFlag.Name)
 	consumer.destination = ctx.GlobalString(DestinationFlag.Name)
+	consumer.shutdown = make(chan struct{})
 	return consumer.prepareConsumer()
 }
 
@@ -174,7 +199,11 @@ func main() {
 	defer signal.Stop(sigchan)
 	log.Printf("Got interrupt, shutting down...singal=%v\n", <-sigchan)
 	if consumer != nil {
+		if consumer.shutdown != nil {
+			close(consumer.shutdown)
+		}
 		consumer.close(3)
+		consumer.done.Wait()
 	}
 	log.Println("AMQP Listener gracefully stopped")
 }

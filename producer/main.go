@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"time"
@@ -51,19 +50,19 @@ func (producer *Producer) close(seconds time.Duration) {
 }
 
 func (producer *Producer) sendMsg(message string) {
+	if producer.Sender == nil {
+		err := producer.prepareSender()
+		if err != nil {
+			log.Println("Failed to connect to server!")
+			time.Sleep(1 * time.Second)
+			return
+		}
+	}
 	// Send message
 	err := producer.Sender.Send(producer.Context, amqp.NewMessage([]byte(message)))
 	if err != nil {
-
-		if _, ok := err.(net.Error); ok {
-			log.Printf("Sending message: %v\n, Re connecting ...", err)
-			producer.prepareSender()
-			time.Sleep(1 * time.Second)
-			producer.sendMsg(message)
-		} else {
-			producer.close(3)
-			log.Panicf("unkonwn error: %v\n", err)
-		}
+		log.Printf("Sending message: %v\n, Re connecting ...", err)
+		producer.Sender = nil
 	} else {
 		log.Println("Send message to queue completed.")
 	}
@@ -95,7 +94,7 @@ func (producer *Producer) prepareSender() error {
 	producer.Session = nil
 	producer.Sender = nil
 	producer.Context = context.Background()
-	client, err := amqp.Dial(producer.url)
+	client, err := amqp.Dial(producer.url, amqp.ConnIdleTimeout(0))
 	if err != nil {
 		log.Printf("Dialing AMQP server: %v\n", err)
 		return err
